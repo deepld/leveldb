@@ -14,6 +14,7 @@ namespace leveldb {
 
 struct Options;
 
+// 用于 block 的写入
 class BlockBuilder {
  public:
   explicit BlockBuilder(const Options* options);

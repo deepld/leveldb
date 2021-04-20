@@ -51,6 +51,7 @@ struct DBImpl::Writer {
   port::CondVar cv;
 };
 
+// 记录 compact 过程所有中间信息
 struct DBImpl::CompactionState {
   // Files produced by compaction
   struct Output {
@@ -132,6 +133,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       owns_info_log_(options_.info_log != raw_options.info_log),
       owns_cache_(options_.block_cache != raw_options.block_cache),
       dbname_(dbname),
+      // sst file 的 cache，缓存 meta 信息
       table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
       db_lock_(nullptr),
       shutting_down_(false),
@@ -321,6 +323,7 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
     }
   }
 
+  // 恢复文件集合
   s = versions_->Recover(save_manifest);
   if (!s.ok()) {
     return s;
@@ -346,9 +349,13 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   uint64_t number;
   FileType type;
   std::vector<uint64_t> logs;
+
   for (size_t i = 0; i < filenames.size(); i++) {
     if (ParseFileName(filenames[i], &number, &type)) {
+      // 检查 menifest 中的文件，是否都在目录中是存在的
       expected.erase(number);
+
+      // 这里可能存在，还未写入到 menifest 的log，也将replay 到 memtable
       if (type == kLogFile && ((number >= min_log) || (number == prev_log)))
         logs.push_back(number);
     }
@@ -375,6 +382,7 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
     versions_->MarkFileNumberUsed(logs[i]);
   }
 
+  // 更新 max_sequence
   if (versions_->LastSequence() < max_sequence) {
     versions_->SetLastSequence(max_sequence);
   }
@@ -382,6 +390,9 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
   return Status::OK();
 }
 
+// log replay 到 mem table；写满后生成一个新的 sst file
+//    强制最后一个 memlayer，如果有任何内容，必然写入一个sst file
+//    期间生成了新的 sst，就想 Version edit 中添加记录
 Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
                               bool* save_manifest, VersionEdit* edit,
                               SequenceNumber* max_sequence) {
@@ -435,8 +446,10 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
                           Status::Corruption("log record too small"));
       continue;
     }
+    // 从 record 恢复到一个 batch write
     WriteBatchInternal::SetContents(&batch, record);
 
+    // 确保 memlayer 存在，确保 write 写入到 memtable
     if (mem == nullptr) {
       mem = new MemTable(internal_comparator_);
       mem->Ref();
@@ -446,12 +459,15 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
     if (!status.ok()) {
       break;
     }
+
+    // 这里write时，一个batch中的所有log，应该是共享 seqno？----
     const SequenceNumber last_seq = WriteBatchInternal::Sequence(&batch) +
                                     WriteBatchInternal::Count(&batch) - 1;
     if (last_seq > *max_sequence) {
       *max_sequence = last_seq;
     }
 
+    // 当前 mem table 已经写满了，生成新的
     if (mem->ApproximateMemoryUsage() > options_.write_buffer_size) {
       compactions++;
       *save_manifest = true;
@@ -468,6 +484,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
 
   delete file;
 
+  // 重用 log 文件
   // See if we should keep reusing the last log file.
   if (status.ok() && options_.reuse_logs && last_log && compactions == 0) {
     assert(logfile_ == nullptr);
@@ -546,6 +563,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   return s;
 }
 
+// 将 imm_ 写入到 sst 中
 void DBImpl::CompactMemTable() {
   mutex_.AssertHeld();
   assert(imm_ != nullptr);
@@ -565,6 +583,8 @@ void DBImpl::CompactMemTable() {
   if (s.ok()) {
     edit.SetPrevLogNumber(0);
     edit.SetLogNumber(logfile_number_);  // Earlier logs no longer needed
+
+    // 更新 menifest，将新增的log写入进去
     s = versions_->LogAndApply(&edit, &mutex_);
   }
 
@@ -579,9 +599,11 @@ void DBImpl::CompactMemTable() {
   }
 }
 
+// 手动指定了compact，这是在用户线程执行的，前台等待完成
 void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
   int max_level_with_files = 1;
   {
+    // 找到有重叠的 level，全部要进行 compact
     MutexLock l(&mutex_);
     Version* base = versions_->current();
     for (int level = 1; level < config::kNumLevels; level++) {
@@ -590,12 +612,20 @@ void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
       }
     }
   }
+  // 要等待之前的 mem compact 完成
   TEST_CompactMemTable();  // TODO(sanjay): Skip if memtable does not overlap
+
+  // 从 level 0 层来时一直进行 merge；
+  //    第一次 merge 的结果，是否还会参与下一层的 merge ？
+  //    这里是每层单独进行的，因此该 range 的那些 key，会一直 merge 到最后一层去
   for (int level = 0; level < max_level_with_files; level++) {
     TEST_CompactRange(level, begin, end);
   }
 }
 
+// 执行 level n 的compact直到完成
+//    一次手动 compacgt，会触发多 level；ManualCompaction 对应一个 level 的任务
+//    每个 level内部，可能也要分成多次 compact 过程
 void DBImpl::TEST_CompactRange(int level, const Slice* begin,
                                const Slice* end) {
   assert(level >= 0);
@@ -606,6 +636,8 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,
   ManualCompaction manual;
   manual.level = level;
   manual.done = false;
+
+  // user key 扩充到 internal key
   if (begin == nullptr) {
     manual.begin = nullptr;
   } else {
@@ -623,6 +655,7 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,
   while (!manual.done && !shutting_down_.load(std::memory_order_acquire) &&
          bg_error_.ok()) {
     if (manual_compaction_ == nullptr) {  // Idle
+      // 记录当前compact的触发方式；后续compact时候可以查询到 manual 的具体参数
       manual_compaction_ = &manual;
       MaybeScheduleCompaction();
     } else {  // Running either my compaction or another compaction.
@@ -635,6 +668,7 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,
   }
 }
 
+// 只是等之前的 memtable compact 完成
 Status DBImpl::TEST_CompactMemTable() {
   // nullptr batch means just wait for earlier writes to be done
   Status s = Write(WriteOptions(), nullptr);
@@ -659,6 +693,12 @@ void DBImpl::RecordBackgroundError(const Status& s) {
   }
 }
 
+// 是否在新线程中启动 compact 任务
+//  1. 启动时检查
+//  2. 手动触发
+//  2. write 时触发 memtable flush；
+//  3. get 重复啊的 seek compact
+//  4. 上一次compact完成之后，重新检查是否有未完成 compact 任务
 void DBImpl::MaybeScheduleCompaction() {
   mutex_.AssertHeld();
   if (background_compaction_scheduled_) {
@@ -693,6 +733,7 @@ void DBImpl::BackgroundCall() {
 
   background_compaction_scheduled_ = false;
 
+  // 是否再次发起任务
   // Previous compaction may have produced too many files in a level,
   // so reschedule another compaction if needed.
   MaybeScheduleCompaction();
@@ -702,6 +743,7 @@ void DBImpl::BackgroundCall() {
 void DBImpl::BackgroundCompaction() {
   mutex_.AssertHeld();
 
+  // 无论何时，都是优先进行 memtable 的 compact
   if (imm_ != nullptr) {
     CompactMemTable();
     return;
@@ -713,8 +755,11 @@ void DBImpl::BackgroundCompaction() {
   if (is_manual) {
     ManualCompaction* m = manual_compaction_;
     c = versions_->CompactRange(m->level, m->begin, m->end);
+
+    // 上一次可能已经 compact 完成了，设置 done
     m->done = (c == nullptr);
     if (c != nullptr) {
+      // level n 中最大的 key，有可能本层参与的file太多，只选取了其中的一部分；其他的需要重新加入队列执行
       manual_end = c->input(0, c->num_input_files(0) - 1)->largest;
     }
     Log(options_.info_log,
@@ -729,6 +774,9 @@ void DBImpl::BackgroundCompaction() {
   Status status;
   if (c == nullptr) {
     // Nothing to do
+
+  // 只是将 level 一个文件自己进行 compact（没有 level + 1的参与），可以直接进行 move 到 level + 1 层
+  //    但是要检查，其将来不会造成 level + 2 的compact 压力过大
   } else if (!is_manual && c->IsTrivialMove()) {
     // Move file to next level
     assert(c->num_input_files(0) == 1);
@@ -746,6 +794,7 @@ void DBImpl::BackgroundCompaction() {
         static_cast<unsigned long long>(f->file_size),
         status.ToString().c_str(), versions_->LevelSummary(&tmp));
   } else {
+    // 记录 compact 的计划、产生的文件等
     CompactionState* compact = new CompactionState(c);
     status = DoCompactionWork(compact);
     if (!status.ok()) {
@@ -773,6 +822,7 @@ void DBImpl::BackgroundCompaction() {
     if (!m->done) {
       // We only compacted part of the requested range.  Update *m
       // to the range that is left to be compacted.
+      // 记录 manual compact 的断点
       m->tmp_storage = manual_end;
       m->begin = &m->tmp_storage;
     }
@@ -790,6 +840,8 @@ void DBImpl::CleanupCompaction(CompactionState* compact) {
     assert(compact->outfile == nullptr);
   }
   delete compact->outfile;
+
+  // 从临时文件集合中清理
   for (size_t i = 0; i < compact->outputs.size(); i++) {
     const CompactionState::Output& out = compact->outputs[i];
     pending_outputs_.erase(out.number);
@@ -855,6 +907,7 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
   delete compact->outfile;
   compact->outfile = nullptr;
 
+  // load 到 table cache 中去
   if (s.ok() && current_entries > 0) {
     // Verify that the table is usable
     Iterator* iter =
@@ -871,6 +924,7 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
   return s;
 }
 
+// 将compact的结果，写入到 menifest 文件中
 Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   mutex_.AssertHeld();
   Log(options_.info_log, "Compacted %d@%d + %d@%d files => %lld bytes",
@@ -901,12 +955,15 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
   assert(compact->builder == nullptr);
   assert(compact->outfile == nullptr);
+
   if (snapshots_.empty()) {
     compact->smallest_snapshot = versions_->LastSequence();
   } else {
+    // 有人正在访问，那么就
     compact->smallest_snapshot = snapshots_.oldest()->sequence_number();
   }
 
+  // 使用 MergeIterator 进行归并排序
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
 
   // Release mutex while we're actually doing the compaction work
@@ -919,6 +976,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   bool has_current_user_key = false;
   SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
   while (input->Valid() && !shutting_down_.load(std::memory_order_acquire)) {
+
+    // 任何时候，出现了 MemLayer 的 compact，立即优先执行；这个是不能等待的
     // Prioritize immutable compaction work
     if (has_imm_.load(std::memory_order_relaxed)) {
       const uint64_t imm_start = env_->NowMicros();
@@ -932,6 +991,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       imm_micros += (env_->NowMicros() - imm_start);
     }
 
+    // 当前这个 sst output，将来是否会引起 level + 2 产生太多的 compact 压力；
+    //    再生成一个新的 sst 文件，继续compact
     Slice key = input->key();
     if (compact->compaction->ShouldStopBefore(key) &&
         compact->builder != nullptr) {
@@ -949,6 +1010,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       has_current_user_key = false;
       last_sequence_for_key = kMaxSequenceNumber;
     } else {
+      // 记录当前正在进行的 key
       if (!has_current_user_key ||
           user_comparator()->Compare(ikey.user_key, Slice(current_user_key)) !=
               0) {
@@ -958,9 +1020,14 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
         last_sequence_for_key = kMaxSequenceNumber;
       }
 
+      // 每次遇到 new key，last_sequence_for_key 将会设置为 kMaxSequenceNumber
+      //    这里 < smallest_snapshot, 表明至少已经是 key的第二次出现了；那么直接丢弃
       if (last_sequence_for_key <= compact->smallest_snapshot) {
         // Hidden by an newer entry for same user key
         drop = true;  // (A)
+
+      // 每个 delete 都要检查这么多，是否性能堪忧？ [ IsBaseLevelForKey ]
+      //    也许更方便的，是直接将delete保留，直到最后一层？
       } else if (ikey.type == kTypeDeletion &&
                  ikey.sequence <= compact->smallest_snapshot &&
                  compact->compaction->IsBaseLevelForKey(ikey.user_key)) {
@@ -987,6 +1054,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
 #endif
 
     if (!drop) {
+      // 第一次，构建 builder，并记录 key的范围
       // Open output file if necessary
       if (compact->builder == nullptr) {
         status = OpenCompactionOutputFile(compact);
@@ -997,9 +1065,11 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       if (compact->builder->NumEntries() == 0) {
         compact->current_output()->smallest.DecodeFrom(key);
       }
+
       compact->current_output()->largest.DecodeFrom(key);
       compact->builder->Add(key, input->value());
 
+      // 达到sst文件大小，就换成下一个文件
       // Close output file if it is big enough
       if (compact->builder->FileSize() >=
           compact->compaction->MaxOutputFileSize()) {
@@ -1025,6 +1095,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   delete input;
   input = nullptr;
 
+  // 更新一些统计信息，方便 client 进行查看
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros - imm_micros;
   for (int which = 0; which < 2; which++) {
@@ -1039,6 +1110,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   mutex_.Lock();
   stats_[compact->compaction->level() + 1].Add(stats);
 
+  // 文件加入到 menifset 中
   if (status.ok()) {
     status = InstallCompactionResults(compact);
   }
@@ -1074,6 +1146,7 @@ static void CleanupIteratorState(void* arg1, void* arg2) {
 
 }  // anonymous namespace
 
+
 Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
                                       SequenceNumber* latest_snapshot,
                                       uint32_t* seed) {
@@ -1088,14 +1161,18 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
     list.push_back(imm_->NewIterator());
     imm_->Ref();
   }
+
+  // mem、imm、所有 level 的 sst 文件的 iterator
   versions_->current()->AddIterators(options, &list);
   Iterator* internal_iter =
       NewMergingIterator(&internal_comparator_, &list[0], list.size());
   versions_->current()->Ref();
 
+  // 告知使用完成之后，如何清理 mem、imm 的引用
   IterState* cleanup = new IterState(&mutex_, mem_, imm_, versions_->current());
   internal_iter->RegisterCleanup(CleanupIteratorState, cleanup, nullptr);
 
+  // seed 用于 iterator 时的 sampling
   *seed = ++seed_;
   mutex_.Unlock();
   return internal_iter;
@@ -1124,6 +1201,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
     snapshot = versions_->LastSequence();
   }
 
+  // 对 mem、imm 增加引用数
   MemTable* mem = mem_;
   MemTable* imm = imm_;
   Version* current = versions_->current();
@@ -1136,6 +1214,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
 
   // Unlock while reading from files and memtables
   {
+    // 现在 mem、imm 中查找，找到即返回
     mutex_.Unlock();
     // First look in the memtable, then in the immutable memtable (if any).
     LookupKey lkey(key, snapshot);
@@ -1150,6 +1229,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
     mutex_.Lock();
   }
 
+  // 访问超过 2 个文件时，检查第一个sst文件，是否触发了 seek compaction
   if (have_stat_update && current->UpdateStats(stats)) {
     MaybeScheduleCompaction();
   }
@@ -1159,6 +1239,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
   return s;
 }
 
+// 遍历数据库的 iterator 入口
 Iterator* DBImpl::NewIterator(const ReadOptions& options) {
   SequenceNumber latest_snapshot;
   uint32_t seed;
@@ -1197,6 +1278,8 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
   return DB::Delete(options, key);
 }
 
+// group write，每次只有一个线程写入；
+//    write-write 之间是加锁互斥的； memlayer 只支持 read-write互斥，也不支持 write-write
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   Writer w(&mutex_);
   w.batch = updates;
@@ -1372,6 +1455,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       delete logfile_;
       logfile_ = lfile;
       logfile_number_ = new_log_number;
+      // 每次变更 memtable 时，都会生成一个新的 log
       log_ = new log::Writer(lfile);
       imm_ = mem_;
       has_imm_.store(true, std::memory_order_release);
@@ -1489,6 +1573,8 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   // Recover handles create_if_missing, error_if_exists
   bool save_manifest = false;
   Status s = impl->Recover(&edit, &save_manifest);
+
+  // 如果里边没有 replay log，这里就新生成一个，并新增 memtable
   if (s.ok() && impl->mem_ == nullptr) {
     // Create new log and a corresponding memtable.
     uint64_t new_log_number = impl->versions_->NewFileNumber();
@@ -1504,9 +1590,12 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
       impl->mem_->Ref();
     }
   }
+
   if (s.ok() && save_manifest) {
     edit.SetPrevLogNumber(0);  // No older logs needed after recovery.
     edit.SetLogNumber(impl->logfile_number_);
+
+    // save_manifest: 使用了新的 menifest文件，或者 log replay 过程中，生成了新的 sst
     s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
   }
   if (s.ok()) {

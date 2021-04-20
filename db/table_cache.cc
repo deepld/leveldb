@@ -38,6 +38,9 @@ TableCache::TableCache(const std::string& dbname, const Options& options,
 
 TableCache::~TableCache() { delete cache_; }
 
+// 确保sst文件在 cache 中存在
+//    cache 中是否存在，不存在 load sst 文件，并存入cache
+//    key：file number，value：TableAndFile
 Status TableCache::FindTable(uint64_t file_number, uint64_t file_size,
                              Cache::Handle** handle) {
   Status s;
@@ -90,6 +93,8 @@ Iterator* TableCache::NewIterator(const ReadOptions& options,
 
   Table* table = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
   Iterator* result = table->NewIterator(options);
+
+  // client 使用完成释放iter之后，从 cache 中 release
   result->RegisterCleanup(&UnrefEntry, cache_, handle);
   if (tableptr != nullptr) {
     *tableptr = table;
@@ -97,10 +102,12 @@ Iterator* TableCache::NewIterator(const ReadOptions& options,
   return result;
 }
 
+// 直接一次性访问，不使用 iter，
 Status TableCache::Get(const ReadOptions& options, uint64_t file_number,
                        uint64_t file_size, const Slice& k, void* arg,
                        void (*handle_result)(void*, const Slice&,
                                              const Slice&)) {
+  // 找到 sst 文件，确保其已经 load 到 table cache
   Cache::Handle* handle = nullptr;
   Status s = FindTable(file_number, file_size, &handle);
   if (s.ok()) {
@@ -111,6 +118,7 @@ Status TableCache::Get(const ReadOptions& options, uint64_t file_number,
   return s;
 }
 
+// 目前，只有在删除文件时，才会进行此操作
 void TableCache::Evict(uint64_t file_number) {
   char buf[sizeof(file_number)];
   EncodeFixed64(buf, file_number);

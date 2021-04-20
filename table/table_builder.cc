@@ -56,6 +56,7 @@ struct TableBuilder::Rep {
   // blocks.
   //
   // Invariant: r->pending_index_entry is true only if data_block is empty.
+  // 表明发生了 block 的切换，需要写入一个 block handle 到index里边
   bool pending_index_entry;
   BlockHandle pending_handle;  // Handle to add to index block
 
@@ -96,11 +97,15 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
   assert(!r->closed);
   if (!ok()) return;
   if (r->num_entries > 0) {
+    // 检查传入的key必须是递增的；last_key 是遍历过程中保留下来的
     assert(r->options.comparator->Compare(key, Slice(r->last_key)) > 0);
   }
 
+  // block 切换后，但直到下一个 block 中的key出现时，才会记录当前 block 在 index block 中的 key -> offset
+  //    这样可以根据 last block last key 和 当前 block first key比较，选一个小一点的key作为limit，可以作为本 block 的 index，减少空间占用
   if (r->pending_index_entry) {
     assert(r->data_block.empty());
+    // index block 中记录的key，是这个 block 里边最大的 key
     r->options.comparator->FindShortestSeparator(&r->last_key, key);
     std::string handle_encoding;
     r->pending_handle.EncodeTo(&handle_encoding);
@@ -108,6 +113,7 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
     r->pending_index_entry = false;
   }
 
+  // 添加到 filter 中
   if (r->filter_block != nullptr) {
     r->filter_block->AddKey(key);
   }
@@ -117,11 +123,14 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
   r->data_block.Add(key, value);
 
   const size_t estimated_block_size = r->data_block.CurrentSizeEstimate();
+
+  // 每超过 block size，就重置 block：写入 index block
   if (estimated_block_size >= r->options.block_size) {
     Flush();
   }
 }
 
+// 当前block生成完成: data 部分写入到磁盘；filter block进行重置
 void TableBuilder::Flush() {
   Rep* r = rep_;
   assert(!r->closed);
@@ -133,12 +142,16 @@ void TableBuilder::Flush() {
     r->pending_index_entry = true;
     r->status = r->file->Flush();
   }
+
+  // 重置 filter block，生成一个新的 "page"
+  //    一个 filter block page 中，根据 size-4K 会分成多个filter
   if (r->filter_block != nullptr) {
     r->filter_block->StartBlock(r->offset);
   }
 }
 
 void TableBuilder::WriteBlock(BlockBuilder* block, BlockHandle* handle) {
+  // 将 block 压缩后，写入到file中，记录当前 offset 到 BlockHandle 中
   // File format contains a sequence of blocks where each block has:
   //    block_data: uint8[n]
   //    type: uint8
@@ -203,11 +216,14 @@ Status TableBuilder::Finish() {
 
   BlockHandle filter_block_handle, metaindex_block_handle, index_block_handle;
 
+  // filter 不进行压缩
   // Write filter block
   if (ok() && r->filter_block != nullptr) {
     WriteRawBlock(r->filter_block->Finish(), kNoCompression,
                   &filter_block_handle);
   }
+
+  // 写入 meta block、index block，获取 meta offset、index offset，记录到footer
 
   // Write metaindex block
   if (ok()) {

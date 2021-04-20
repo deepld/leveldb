@@ -64,6 +64,7 @@ class LEVELDB_EXPORT Cache {
   // longer needed.
   virtual Handle* Lookup(const Slice& key) = 0;
 
+  // 减少引用数，
   // Release a mapping returned by a previous Lookup().
   // REQUIRES: handle must not have been released yet.
   // REQUIRES: handle must have been returned by a method on *this.
@@ -75,6 +76,7 @@ class LEVELDB_EXPORT Cache {
   // REQUIRES: handle must have been returned by a method on *this.
   virtual void* Value(Handle* handle) = 0;
 
+  // 与release不同的是，直接删除
   // If the cache contains entry for key, erase it.  Note that the
   // underlying entry will be kept around until all existing handles
   // to it have been released.

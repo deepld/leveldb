@@ -74,6 +74,7 @@ class MergingIterator : public Iterator {
       direction_ = kForward;
     }
 
+    // 上次已经取走的 iterator move
     current_->Next();
     FindSmallest();
   }

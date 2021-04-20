@@ -25,6 +25,9 @@ MemTable::~MemTable() { assert(refs_ == 0); }
 
 size_t MemTable::ApproximateMemoryUsage() { return arena_.MemoryUsage(); }
 
+// 比较器： KeyComparator -> InternalKeyComparator -> UserKeyComparator
+// 格式：  key len | key
+// 这样存储，因为 memtale 是一个 set，需要把 key、value encode 到一起，连续存储方便管理
 int MemTable::KeyComparator::operator()(const char* aptr,
                                         const char* bptr) const {
   // Internal keys are encoded as length-prefixed strings.
@@ -99,6 +102,7 @@ void MemTable::Add(SequenceNumber s, ValueType type, const Slice& key,
 }
 
 bool MemTable::Get(const LookupKey& key, std::string* value, Status* s) {
+  // 实际比较，用得都是user key
   Slice memkey = key.memtable_key();
   Table::Iterator iter(&table_);
   iter.Seek(memkey.data());

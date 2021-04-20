@@ -345,6 +345,7 @@ void SkipList<Key, Comparator>::Insert(const Key& key) {
 
   int height = RandomHeight();
   if (height > GetMaxHeight()) {
+    // 超过当前 height 的部分，prev 设置为 head
     for (int i = GetMaxHeight(); i < height; i++) {
       prev[i] = head_;
     }

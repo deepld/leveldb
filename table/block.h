@@ -15,6 +15,7 @@ namespace leveldb {
 struct BlockContents;
 class Comparator;
 
+// 该类仅用于读取 一个 block 的内容
 class Block {
  public:
   // Initialize the block with the specified contents.

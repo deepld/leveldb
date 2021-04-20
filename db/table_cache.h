@@ -19,6 +19,7 @@ namespace leveldb {
 
 class Env;
 
+// 用于缓存所有 sst 文件的 meta 信息， file number -> table （index block， meta block）
 class TableCache {
  public:
   TableCache(const std::string& dbname, const Options& options, int entries);

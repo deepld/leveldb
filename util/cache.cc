@@ -147,6 +147,7 @@ class HandleTable {
   }
 };
 
+// Cache的访问，是全程加锁的
 // A single shard of sharded cache.
 class LRUCache {
  public:
@@ -192,6 +193,9 @@ class LRUCache {
   // Entries are in use by clients, and have refs >= 2 and in_cache==true.
   LRUHandle in_use_ GUARDED_BY(mutex_);
 
+  // 所有的数据，都有 key 索引 - HandleTable，ref = 0
+  //    client 使用时，将其移动到 use list 的头部
+  //    client 使用完，将其移动到 lru list 的头部
   HandleTable table_ GUARDED_BY(mutex_);
 };
 
@@ -226,10 +230,13 @@ void LRUCache::Ref(LRUHandle* e) {
 void LRUCache::Unref(LRUHandle* e) {
   assert(e->refs > 0);
   e->refs--;
+  // 一开始就没有存储在cache中，直接清理
   if (e->refs == 0) {  // Deallocate.
     assert(!e->in_cache);
     (*e->deleter)(e->key(), e->value);
     free(e);
+
+  // 更新其在 lru 中的位置
   } else if (e->in_cache && e->refs == 1) {
     // No longer in use; move to lru_ list.
     LRU_Remove(e);

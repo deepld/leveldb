@@ -22,6 +22,7 @@ inline uint32_t Block::NumRestarts() const {
   return DecodeFixed32(data_ + size_ - sizeof(uint32_t));
 }
 
+// data1、data2 ... | restart point
 Block::Block(const BlockContents& contents)
     : data_(contents.data.data()),
       size_(contents.data.size()),
@@ -59,6 +60,8 @@ static inline const char* DecodeEntry(const char* p, const char* limit,
   *shared = reinterpret_cast<const uint8_t*>(p)[0];
   *non_shared = reinterpret_cast<const uint8_t*>(p)[1];
   *value_length = reinterpret_cast<const uint8_t*>(p)[2];
+
+  // 快速解析方式：发现三个都没超过 128 字节，解析长度完成
   if ((*shared | *non_shared | *value_length) < 128) {
     // Fast path: all three values are encoded in one byte each
     p += 3;
@@ -74,10 +77,14 @@ static inline const char* DecodeEntry(const char* p, const char* limit,
   return p;
 }
 
+// 按照 restart point 来进行遍历
 class Block::Iter : public Iterator {
  private:
   const Comparator* const comparator_;
-  const char* const data_;       // underlying block contents
+  const char* const data_;       // underlying block contentsz
+
+  // 相当于所有数据的末尾: data... | restart point array，
+  //        restarts_ 指向的是 array 的地址，代表 data 部分的结尾
   uint32_t const restarts_;      // Offset of restart array (list of fixed32)
   uint32_t const num_restarts_;  // Number of uint32_t entries in restart array
 
@@ -143,6 +150,7 @@ class Block::Iter : public Iterator {
   void Prev() override {
     assert(Valid());
 
+    // 检查是否要要先退回到上一个 restart point
     // Scan backwards to a restart point before current_
     const uint32_t original = current_;
     while (GetRestartPoint(restart_index_) >= original) {
@@ -155,7 +163,10 @@ class Block::Iter : public Iterator {
       restart_index_--;
     }
 
+    // 每次都要重置到 restart point的 开始位置，效率很低
     SeekToRestartPoint(restart_index_);
+
+    // 从这个 restart point 的头部开始遍历，直到找到当前 key 的位置前一个停下来
     do {
       // Loop until end of current entry hits the start of original entry
     } while (ParseNextKey() && NextEntryOffset() < original);
@@ -168,6 +179,7 @@ class Block::Iter : public Iterator {
     uint32_t right = num_restarts_ - 1;
     int current_key_compare = 0;
 
+    // 已经处在 search 中了，用当前 key 进行比较，判断是否使用当前 restart_index_，可以减少 search 范围
     if (Valid()) {
       // If we're already scanning, use the current position as a starting
       // point. This is beneficial if the key we're seeking to is ahead of the
@@ -184,6 +196,7 @@ class Block::Iter : public Iterator {
       }
     }
 
+    // 在 restart point 中进行二分查找
     while (left < right) {
       uint32_t mid = (left + right + 1) / 2;
       uint32_t region_offset = GetRestartPoint(mid);
@@ -191,6 +204,7 @@ class Block::Iter : public Iterator {
       const char* key_ptr =
           DecodeEntry(data_ + region_offset, data_ + restarts_, &shared,
                       &non_shared, &value_length);
+      // 这里读取的是每个 restart point 起始位置的 key，是没有 shared 部分的
       if (key_ptr == nullptr || (shared != 0)) {
         CorruptionError();
         return;
@@ -207,6 +221,8 @@ class Block::Iter : public Iterator {
       }
     }
 
+    // 如果之前正在进行访问的block，正式当前 search 的block，并且之前访问的 key < 当前要访问的 key
+    //      那么只要从之前的key往后移动继续查找即可
     // We might be able to use our current position within the restart block.
     // This is true if we determined the key we desire is in the current block
     // and is after than the current key.
@@ -215,11 +231,14 @@ class Block::Iter : public Iterator {
     if (!skip_seek) {
       SeekToRestartPoint(left);
     }
+
+    // 在 restart point 里边找到对应的 key的位置
     // Linear search (within restart block) for first key >= target
     while (true) {
       if (!ParseNextKey()) {
         return;
       }
+      // 一直找到一个 >= key 的位置
       if (Compare(key_, target) >= 0) {
         return;
       }
@@ -248,6 +267,7 @@ class Block::Iter : public Iterator {
   }
 
   bool ParseNextKey() {
+    // 更新到下一个 key 的起始地址
     current_ = NextEntryOffset();
     const char* p = data_ + current_;
     const char* limit = data_ + restarts_;  // Restarts come right after data
@@ -265,9 +285,13 @@ class Block::Iter : public Iterator {
       CorruptionError();
       return false;
     } else {
+      // Key：先保留之前 shared 的部分，然后读取 no_shared 的部分
       key_.resize(shared);
       key_.append(p, non_shared);
       value_ = Slice(p + non_shared, value_length);
+
+      // 检查，是否已经移动到了下一个 restart point的位置了；
+      //      是的话，更新内部状态；确保后续访问是正确的
       while (restart_index_ + 1 < num_restarts_ &&
              GetRestartPoint(restart_index_ + 1) < current_) {
         ++restart_index_;

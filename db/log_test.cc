@@ -258,7 +258,9 @@ uint64_t LogTest::initial_offset_last_record_offsets_[] = {
 int LogTest::num_initial_offset_records_ =
     sizeof(LogTest::initial_offset_last_record_offsets_) / sizeof(uint64_t);
 
-TEST_F(LogTest, Empty) { ASSERT_EQ("EOF", Read()); }
+TEST_F(LogTest, Empty) {
+  ASSERT_EQ("EOF", Read());
+}
 
 TEST_F(LogTest, ReadWrite) {
   Write("foo");

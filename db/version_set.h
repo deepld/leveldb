@@ -190,6 +190,7 @@ class VersionSet {
   // Return the current manifest file number
   uint64_t ManifestFileNumber() const { return manifest_file_number_; }
 
+  // 任何要生成新文件的时候，就会通过这里来分配文件 id
   // Allocate and return a new file number
   uint64_t NewFileNumber() { return next_file_number_++; }
 
@@ -223,6 +224,7 @@ class VersionSet {
   // Return the current log file number.
   uint64_t LogNumber() const { return log_number_; }
 
+  // 仅用于为了 从旧版本的 leveldb 升级到新版本时用到
   // Return the log file number for the log file that is currently
   // being compacted, or zero if there is no such log file.
   uint64_t PrevLogNumber() const { return prev_log_number_; }
@@ -299,6 +301,7 @@ class VersionSet {
   TableCache* const table_cache_;
   const InternalKeyComparator icmp_;
   uint64_t next_file_number_;
+  // 每次启动后，初始化为当前已经存在的、最大的 file 的 number；之后就不再改变；每次运行期间，只会有一个 menifest 存在
   uint64_t manifest_file_number_;
   uint64_t last_sequence_;
   uint64_t log_number_;
@@ -366,6 +369,8 @@ class Compaction {
   int level_;
   uint64_t max_output_file_size_;
   Version* input_version_;
+
+  // 记录此次 compact 过程后，涉及到的版本变更
   VersionEdit edit_;
 
   // Each compaction reads inputs from "level_" and "level_+1"

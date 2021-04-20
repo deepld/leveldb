@@ -97,6 +97,7 @@ Status ReadBlock(RandomAccessFile* file, const ReadOptions& options,
   switch (data[n]) {
     case kNoCompression:
       if (data != buf) {
+        // env 的文件实现中，如果已经缓存了 block 数据，那么就不需要自己再保留一份了
         // File implementation gave us pointer to some other data.
         // Use it directly under the assumption that it will be live
         // while the file is open.

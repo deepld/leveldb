@@ -192,6 +192,7 @@ class LookupKey {
 
   ~LookupKey();
 
+  // 头部多存储了 key len
   // Return a key suitable for lookup in a MemTable.
   Slice memtable_key() const { return Slice(start_, end_ - start_); }
 

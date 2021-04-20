@@ -82,6 +82,7 @@ class DBImpl : public DB {
     bool done;
     const InternalKey* begin;  // null means beginning of key range
     const InternalKey* end;    // null means end of key range
+    // 可能涉及的范围太广，分成多次 merge
     InternalKey tmp_storage;   // Used to keep track of compaction progress
   };
 
@@ -188,6 +189,7 @@ class DBImpl : public DB {
 
   SnapshotList snapshots_ GUARDED_BY(mutex_);
 
+  // 记录临时文件（memtable -> sst, compact -> sst），防止期间清理文件时，将其删除了
   // Set of table files to protect from deletion because they are
   // part of ongoing compactions.
   std::set<uint64_t> pending_outputs_ GUARDED_BY(mutex_);
@@ -202,6 +204,7 @@ class DBImpl : public DB {
   // Have we encountered a background error in paranoid mode?
   Status bg_error_ GUARDED_BY(mutex_);
 
+  // 用于外部的查询需求
   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
 };
 

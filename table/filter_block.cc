@@ -15,6 +15,7 @@ namespace leveldb {
 static const size_t kFilterBaseLg = 11;
 static const size_t kFilterBase = 1 << kFilterBaseLg;
 
+// filter 只是按照 file offset 生成的，可能多个 data block 共享一个 filter；每个 block 必然对应于一个 filter index
 FilterBlockBuilder::FilterBlockBuilder(const FilterPolicy* policy)
     : policy_(policy) {}
 
@@ -37,17 +38,20 @@ Slice FilterBlockBuilder::Finish() {
     GenerateFilter();
   }
 
+  // 记录每个 filter block 在 result string 中的位置
   // Append array of per-filter offsets
   const uint32_t array_offset = result_.size();
   for (size_t i = 0; i < filter_offsets_.size(); i++) {
     PutFixed32(&result_, filter_offsets_[i]);
   }
 
+  // 尾部存放 filter block 的个数
   PutFixed32(&result_, array_offset);
   result_.push_back(kFilterBaseLg);  // Save encoding parameter in result
   return Slice(result_);
 }
 
+// 对一个 data block 中的所有key，生成一个 filter；结果存放在 result
 void FilterBlockBuilder::GenerateFilter() {
   const size_t num_keys = start_.size();
   if (num_keys == 0) {
@@ -95,6 +99,8 @@ bool FilterBlockReader::KeyMayMatch(uint64_t block_offset, const Slice& key) {
     if (start <= limit && limit <= static_cast<size_t>(offset_ - data_)) {
       Slice filter = Slice(data_ + start, limit - start);
       return policy_->KeyMayMatch(key, filter);
+
+    // 这个 index 的 filter 里边没有任何数据
     } else if (start == limit) {
       // Empty filters do not match any keys
       return false;

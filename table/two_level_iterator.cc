@@ -57,14 +57,16 @@ class TwoLevelIterator : public Iterator {
   void SetDataIterator(Iterator* data_iter);
   void InitDataBlock();
 
+  // 根据第一层 iter 的value，来生成 第二层的 iter
   BlockFunction block_function_;
   void* arg_;
   const ReadOptions options_;
   Status status_;
-  IteratorWrapper index_iter_;
-  IteratorWrapper data_iter_;  // May be nullptr
+  IteratorWrapper index_iter_;  // 第一层 iter
+  IteratorWrapper data_iter_;  // May be nullptr，第二层 iter
   // If data_iter_ is non-null, then "data_block_handle_" holds the
   // "index_value" passed to block_function_ to create the data_iter_.
+  // 辅助记录，生成第二层 iter 时，第一层 iter 的value
   std::string data_block_handle_;
 };
 

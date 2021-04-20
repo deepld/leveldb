@@ -17,6 +17,7 @@
 
 namespace leveldb {
 
+// table 对应的实际是 一个 sst file的 meta 信息；内存保存了 index block、bloom filter block
 struct Table::Rep {
   ~Rep() {
     delete filter;
@@ -27,6 +28,8 @@ struct Table::Rep {
   Options options;
   Status status;
   RandomAccessFile* file;
+  // 对 data block 的访问，会混存在 block cache中；cache_id 作为 cache 中 key的一部分存在，以免与其他 sst file 的block冲突
+  //    cache key：cache_id + file offset
   uint64_t cache_id;
   FilterBlockReader* filter;
   const char* filter_data;
@@ -35,6 +38,9 @@ struct Table::Rep {
   Block* index_block;
 };
 
+// 读取一个sst文件的完整内容，每个sst对应于一个 table
+//  footer -> read index --> read meta (only bloom filter now)
+//  table 中缓存了 index block、bloom filter
 Status Table::Open(const Options& options, RandomAccessFile* file,
                    uint64_t size, Table** table) {
   *table = nullptr;
@@ -79,6 +85,7 @@ Status Table::Open(const Options& options, RandomAccessFile* file,
   return s;
 }
 
+// 读出 meta index block，遍历 block，读出每个filter（当前只有bloom filter）
 void Table::ReadMeta(const Footer& footer) {
   if (rep_->options.filter_policy == nullptr) {
     return;  // Do not need any metadata
@@ -99,6 +106,8 @@ void Table::ReadMeta(const Footer& footer) {
 
   Iterator* iter = meta->NewIterator(BytewiseComparator());
   std::string key = "filter.";
+
+  // 根据 option 中指定的 filter 的名字，读出对应的 filter
   key.append(rep_->options.filter_policy->Name());
   iter->Seek(key);
   if (iter->Valid() && iter->key() == Slice(key)) {
@@ -108,6 +117,7 @@ void Table::ReadMeta(const Footer& footer) {
   delete meta;
 }
 
+// 读出 bloom filter 的内容
 void Table::ReadFilter(const Slice& filter_handle_value) {
   Slice v = filter_handle_value;
   BlockHandle filter_handle;
@@ -148,6 +158,8 @@ static void ReleaseBlock(void* arg, void* h) {
   cache->Release(handle);
 }
 
+
+// 用于 sst 内遍历 block 需要切换时，准备下一个block的iteraotr
 // Convert an index iterator value (i.e., an encoded BlockHandle)
 // into an iterator over the contents of the corresponding block.
 Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
@@ -169,11 +181,14 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
       char cache_key_buffer[16];
       EncodeFixed64(cache_key_buffer, table->rep_->cache_id);
       EncodeFixed64(cache_key_buffer + 8, handle.offset());
+      // 使用 cache id| handle offset 作为 key，在block cache 中查询
       Slice key(cache_key_buffer, sizeof(cache_key_buffer));
       cache_handle = block_cache->Lookup(key);
       if (cache_handle != nullptr) {
+        // cache 中读取 block
         block = reinterpret_cast<Block*>(block_cache->Value(cache_handle));
       } else {
+        // 第一次访问block，插入cache；charge 就是block的大小
         s = ReadBlock(table->rep_->file, options, handle, &contents);
         if (s.ok()) {
           block = new Block(contents);
@@ -183,6 +198,8 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
           }
         }
       }
+
+    // 不使用 block cache，每次 new
     } else {
       s = ReadBlock(table->rep_->file, options, handle, &contents);
       if (s.ok()) {
@@ -191,12 +208,15 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
     }
   }
 
+  // 根据是否缓存在 cache 中，后续将使用不同的 release 方式
   Iterator* iter;
   if (block != nullptr) {
     iter = block->NewIterator(table->rep_->options.comparator);
     if (cache_handle == nullptr) {
+      // 如果没有放在 cache 中，用完之后直接删除
       iter->RegisterCleanup(&DeleteBlock, block, nullptr);
     } else {
+      // unref in the cache
       iter->RegisterCleanup(&ReleaseBlock, block_cache, cache_handle);
     }
   } else {
@@ -205,26 +225,32 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
   return iter;
 }
 
+// 通过 index block，遍历每个data block
+//      在在每个data block中访问数据
 Iterator* Table::NewIterator(const ReadOptions& options) const {
   return NewTwoLevelIterator(
       rep_->index_block->NewIterator(rep_->options.comparator),
       &Table::BlockReader, const_cast<Table*>(this), options);
 }
 
+// 直接访问，client 不需要 iter，因此不会返回 iter，仅内部访问需要用到 iter
 Status Table::InternalGet(const ReadOptions& options, const Slice& k, void* arg,
                           void (*handle_result)(void*, const Slice&,
                                                 const Slice&)) {
   Status s;
+  // 搜索 index block，找到对应的 data block；该 block 中，max key > search key
   Iterator* iiter = rep_->index_block->NewIterator(rep_->options.comparator);
   iiter->Seek(k);
   if (iiter->Valid()) {
     Slice handle_value = iiter->value();
     FilterBlockReader* filter = rep_->filter;
     BlockHandle handle;
+    // 找到了对应的block之后，在block内部检查 bloom filter，key 是否存在
     if (filter != nullptr && handle.DecodeFrom(&handle_value).ok() &&
         !filter->KeyMayMatch(handle.offset(), k)) {
       // Not found
     } else {
+      // bloom filter 判断不出来，直接在 block 中 seek 后访问；block 可能被放入缓存
       Iterator* block_iter = BlockReader(this, options, iiter->value());
       block_iter->Seek(k);
       if (block_iter->Valid()) {
@@ -241,6 +267,7 @@ Status Table::InternalGet(const ReadOptions& options, const Slice& k, void* arg,
   return s;
 }
 
+// 查找 index block，得到 key 所在 block 的 offset
 uint64_t Table::ApproximateOffsetOf(const Slice& key) const {
   Iterator* index_iter =
       rep_->index_block->NewIterator(rep_->options.comparator);

@@ -20,6 +20,7 @@ class RandomAccessFile;
 struct ReadOptions;
 class TableCache;
 
+// 对应于一个 sst 文件的内存状态
 // A Table is a sorted map from strings to strings.  Tables are
 // immutable and persistent.  A Table may be safely accessed from
 // multiple threads without external synchronization.

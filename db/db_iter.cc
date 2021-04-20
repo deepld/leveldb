@@ -31,6 +31,10 @@ static void DumpInternalIter(Iterator* iter) {
 
 namespace {
 
+// 将 user key 和 internal key进行不断转换
+//    查询时，传入的是 user key；内部操作时，是internal key；返回时，是user key
+//    还要考虑 key 多个 value的 version问题
+
 // Memtables and sstables that make the DB representation contain
 // (userkey,seq,type) => uservalue entries.  DBIter
 // combines multiple entries for the same userkey found in the DB
@@ -96,6 +100,8 @@ class DBIter : public Iterator {
     if (saved_value_.capacity() > 1048576) {
       std::string empty;
       swap(empty, saved_value_);
+
+    // 碰到大value，导致 size 增长，需要清理string内部存储
     } else {
       saved_value_.clear();
     }
@@ -122,6 +128,8 @@ class DBIter : public Iterator {
 inline bool DBIter::ParseKey(ParsedInternalKey* ikey) {
   Slice k = iter_->key();
 
+  // iterator 访问和 get 一样，检查是否需要 seek compact
+  //    每 read 了 [0, bytes_until_read_sampling_] 的长度，就 sample 一次，查看当前 key 所在文件的 seek compact 状态
   size_t bytes_read = k.size() + iter_->value().size();
   while (bytes_until_read_sampling_ < bytes_read) {
     bytes_until_read_sampling_ += RandomCompactionPeriod();
@@ -189,6 +197,7 @@ void DBIter::FindNextUserEntry(bool skipping, std::string* skip) {
           skipping = true;
           break;
         case kTypeValue:
+          // 跟之前 delete 的 key 一样，就跳过
           if (skipping &&
               user_comparator_->Compare(ikey.user_key, *skip) <= 0) {
             // Entry hidden
@@ -240,6 +249,8 @@ void DBIter::FindPrevUserEntry() {
   if (iter_->Valid()) {
     do {
       ParsedInternalKey ikey;
+
+      // 已经找到了另一个 user key，那么之前 save 的 last key的 value，就是这个 key 的最大 version 的 value
       if (ParseKey(&ikey) && ikey.sequence <= sequence_) {
         if ((value_type != kTypeDeletion) &&
             user_comparator_->Compare(ikey.user_key, saved_key_) < 0) {
@@ -251,6 +262,8 @@ void DBIter::FindPrevUserEntry() {
           saved_key_.clear();
           ClearSavedValue();
         } else {
+
+          // 同一个key，还没找到其最大的 version
           Slice raw_value = iter_->value();
           if (saved_value_.capacity() > raw_value.size() + 1048576) {
             std::string empty;
